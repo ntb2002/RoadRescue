@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RoadRescue</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.css" />
+    <script src="https://unpkg.com/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+        * { font-family: 'Inter', sans-serif; }
+        body { margin: 0; padding: 0; }
+        .leaflet-container { height: 100%; width: 100%; }
+        .bottom-sheet { position: fixed; bottom: 0; left: 0; right: 0; background: white; border-radius: 24px 24px 0 0; box-shadow: 0 -4px 24px rgba(0,0,0,0.15); z-index: 1000; }
+        .uber-button { background: #000; color: white; font-weight: 600; padding: 16px; border-radius: 12px; border: none; cursor: pointer; width: 100%; font-size: 16px; transition: all 0.2s; }
+        .uber-button:hover { background: #333; }
+        .uber-button-white { background: white; color: #000; border: 2px solid #e5e5e5; }
+        .pulse-dot { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
+        .top-bar { position: fixed; top: 0; left: 0; right: 0; background: white; padding: 16px 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); z-index: 999; display: flex; align-items: center; justify-content: space-between; }
+        .slide-up { animation: slideUp 0.3s ease-out; }
+        @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+        .leaflet-routing-container { display: none; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+        const USER_LOCATION = { lat: 43.0481, lng: -76.1474 };
+
+        const mockHelpers = [
+            { id: 1, name: "Mike Johnson", rating: 4.8, distance: 0.5, skills: ["Tire", "Battery"], lat: 43.05, lng: -76.15, vehicle: "White Toyota Tacoma", plate: "NYS-8472" },
+            { id: 2, name: "Sarah Williams", rating: 4.9, distance: 1.2, skills: ["Tire", "Mechanic"], lat: 43.04, lng: -76.13, vehicle: "Blue Honda CR-V", plate: "NYS-2193" },
+            { id: 3, name: "David Chen", rating: 4.7, distance: 2.1, skills: ["Battery", "Lockout"], lat: 43.06, lng: -76.16, vehicle: "Gray Ford F-150", plate: "NYS-5689" },
+            { id: 4, name: "Syracuse Towing", rating: 4.6, distance: 3.5, skills: ["Towing"], isPro: true, lat: 43.03, lng: -76.12, vehicle: "Tow Truck", plate: "COM-3901" },
+        ];
+
+        const problemTypes = [
+            { name: "Flat Tire", basePrice: 35, icon: "🛞", time: "~15 min" },
+            { name: "Dead Battery", basePrice: 30, icon: "🔋", time: "~12 min" },
+            { name: "Out of Gas", basePrice: 40, icon: "⛽", time: "~10 min" },
+            { name: "Lockout", basePrice: 45, icon: "🔑", time: "~20 min" },
+            { name: "Won't Start", basePrice: 50, icon: "🔧", time: "~25 min" },
+            { name: "Need Tow", basePrice: 80, icon: "🚛", time: "~30 min" },
+        ];
+
+        function App() {
+            const [screen, setScreen] = useState('home');
+            const [selectedProblem, setSelectedProblem] = useState(null);
+            const [selectedHelper, setSelectedHelper] = useState(null);
+            const [helperOnline, setHelperOnline] = useState(true);
+            const [currentStep, setCurrentStep] = useState(0);
+            const [helperPosition, setHelperPosition] = useState(null);
+            const [distanceRemaining, setDistanceRemaining] = useState(0);
+            const [etaMinutes, setEtaMinutes] = useState(0);
+            const [routeCoordinates, setRouteCoordinates] = useState([]);
+            const [routeInstructions, setRouteInstructions] = useState([]);
+            const [currentRouteIndex, setCurrentRouteIndex] = useState(0);
+            const [showArrival, setShowArrival] = useState(false);
+            
+            const mapRef = useRef(null);
+            const mapInstance = useRef(null);
+            const helperMarkerRef = useRef(null);
+            const routeLineRef = useRef(null);
+            const routingControlRef = useRef(null);
+
+            const calculatePrice = (problem, distance) => (problem.basePrice + distance * 5).toFixed(2);
+
+            // Get direction icon based on turn type
+            const getDirectionIcon = (instruction) => {
+                const lower = instruction.toLowerCase();
+                if (lower.includes('left')) return '⬅️';
+                if (lower.includes('right')) return '➡️';
+                if (lower.includes('straight') || lower.includes('continue')) return '⬆️';
+                if (lower.includes('arrive') || lower.includes('destination')) return '🎯';
+                return '⬆️';
+            };
+
+            // Extract street name from instruction
+            const getStreetName = (instruction) => {
+                const match = instruction.match(/on (.+?)(?:,|$| for| toward)/i);
+                if (match) return match[1];
+                const onMatch = instruction.match(/onto (.+?)(?:,|$| for| toward)/i);
+                if (onMatch) return onMatch[1];
+                return 'Route';
+            };
+
+            // Fetch real route using Leaflet Routing Machine
+            const fetchRoute = (startLat, startLng, endLat, endLng) => {
+                return new Promise((resolve) => {
+                    if (!mapInstance.current) {
+                        resolve(null);
+                        return;
+                    }
+
+                    // Remove existing routing control if present
+                    if (routingControlRef.current) {
+                        mapInstance.current.removeControl(routingControlRef.current);
+                    }
+
+                    const control = L.Routing.control({
+                        waypoints: [
+                            L.latLng(startLat, startLng),
+                            L.latLng(endLat, endLng)
+                        ],
+                        routeWhileDragging: false,
+                        addWaypoints: false,
+                        draggableWaypoints: false,
+                        fitSelectedRoutes: false,
+                        showAlternatives: false,
+                        lineOptions: {
+                            styles: [{ color: '#000', weight: 0, opacity: 0 }]
+                        },
+                        createMarker: () => null,
+                    });
+
+                    control.on('routesfound', (e) => {
+                        const route = e.routes[0];
+                        const coordinates = route.coordinates;
+                        const instructions = route.instructions.map(inst => ({
+                            instruction: inst.text,
+                            distance: inst.distance > 1000 
+                                ? `${(inst.distance / 1609).toFixed(1)} mi`
+                                : `${Math.round(inst.distance * 3.281)} ft`,
+                            icon: getDirectionIcon(inst.text),
+                            street: getStreetName(inst.text)
+                        }));
+                        
+                        resolve({ coordinates, instructions, totalDistance: route.summary.totalDistance });
+                        
+                        // Remove the control after getting the route
+                        if (mapInstance.current && control) {
+                            mapInstance.current.removeControl(control);
+                        }
+                    });
+
+                    routingControlRef.current = control;
+                    control.addTo(mapInstance.current);
+                });
+            };
+
+            // Initialize route when navigation starts
+            useEffect(() => {
+                if ((screen === 'helperNavigation' || screen === 'activeHelp') && routeCoordinates.length === 0) {
+                    // Wait for map to be ready before calculating route
+                    const checkMapAndRoute = () => {
+                        if (!mapInstance.current) {
+                            // Map not ready yet, try again in 100ms
+                            setTimeout(checkMapAndRoute, 100);
+                            return;
+                        }
+
+                        // For helper mode, use a random nearby helper position
+                        // For customer mode, use the selected helper's position
+                        let startLat, startLng;
+                        if (screen === 'helperNavigation') {
+                            // Helper mode - pick a random nearby starting position
+                            const randomHelper = mockHelpers[Math.floor(Math.random() * mockHelpers.length)];
+                            startLat = randomHelper.lat;
+                            startLng = randomHelper.lng;
+                        } else {
+                            // Customer mode - use selected helper
+                            startLat = selectedHelper ? selectedHelper.lat : USER_LOCATION.lat - 0.008;
+                            startLng = selectedHelper ? selectedHelper.lng : USER_LOCATION.lng - 0.008;
+                        }
+
+                        // Add timeout for route calculation
+                        const timeoutId = setTimeout(() => {
+                            console.error('Route calculation timeout - using fallback');
+                            // Fallback to simple straight line if routing fails
+                            const simpleRoute = [
+                                { lat: startLat, lng: startLng },
+                                { lat: USER_LOCATION.lat, lng: USER_LOCATION.lng }
+                            ];
+                            setRouteCoordinates(simpleRoute);
+                            setRouteInstructions([
+                                { instruction: "Head to destination", distance: "0.8 mi", icon: "⬆️", street: "Route" },
+                                { instruction: "Arrive at destination", distance: "50 ft", icon: "🎯", street: "Destination" }
+                            ]);
+                            setHelperPosition({ lat: startLat, lng: startLng });
+                            setDistanceRemaining(0.8);
+                            setEtaMinutes(3);
+                            setCurrentRouteIndex(0);
+                        }, 5000);
+
+                        fetchRoute(startLat, startLng, USER_LOCATION.lat, USER_LOCATION.lng).then(routeData => {
+                            clearTimeout(timeoutId);
+                            if (routeData) {
+                                setRouteCoordinates(routeData.coordinates);
+                                setRouteInstructions(routeData.instructions);
+                                setHelperPosition({
+                                    lat: routeData.coordinates[0].lat,
+                                    lng: routeData.coordinates[0].lng
+                                });
+                                setDistanceRemaining((routeData.totalDistance / 1609).toFixed(1)); // Convert meters to miles
+                                setEtaMinutes(Math.round((routeData.totalDistance / 1609) * 3)); // Rough ETA calculation
+                                setCurrentRouteIndex(0);
+                            }
+                        }).catch(error => {
+                            clearTimeout(timeoutId);
+                            console.error('Route calculation failed:', error);
+                            // Use fallback
+                            const simpleRoute = [
+                                { lat: startLat, lng: startLng },
+                                { lat: USER_LOCATION.lat, lng: USER_LOCATION.lng }
+                            ];
+                            setRouteCoordinates(simpleRoute);
+                            setRouteInstructions([
+                                { instruction: "Head to destination", distance: "0.8 mi", icon: "⬆️", street: "Route" },
+                                { instruction: "Arrive at destination", distance: "50 ft", icon: "🎯", street: "Destination" }
+                            ]);
+                            setHelperPosition({ lat: startLat, lng: startLng });
+                            setDistanceRemaining(0.8);
+                            setEtaMinutes(3);
+                            setCurrentRouteIndex(0);
+                        });
+                    };
+
+                    // Start checking for map
+                    checkMapAndRoute();
+                }
+            }, [screen]);
+
+            // Animate helper along the route
+            useEffect(() => {
+                if ((screen === 'helperNavigation' || screen === 'activeHelp') && routeCoordinates.length > 0) {
+                    const interval = setInterval(() => {
+                        setCurrentRouteIndex(prev => {
+                            const next = prev + 1;
+                            if (next >= routeCoordinates.length) {
+                                clearInterval(interval);
+                                setShowArrival(true);
+                                const message = screen === 'helperNavigation' ? '🎉 You have arrived!' : '🎉 Helper has arrived!';
+                                setTimeout(() => alert(message), 500);
+                                return prev;
+                            }
+
+                            const newPos = routeCoordinates[next];
+                            setHelperPosition({ lat: newPos.lat, lng: newPos.lng });
+
+                            // Update remaining distance and ETA
+                            const totalPoints = routeCoordinates.length;
+                            const progress = next / totalPoints;
+
+                            setDistanceRemaining(prev => Math.max(0.01, prev * (1 - (1 / totalPoints))));
+                            setEtaMinutes(prev => Math.max(0.01, prev * (1 - (1 / totalPoints))));
+
+                            // Update current step based on route instructions
+                            if (routeInstructions.length > 0) {
+                                const stepProgress = Math.floor(progress * routeInstructions.length);
+                                const newStep = Math.min(stepProgress, routeInstructions.length - 1);
+                                setCurrentStep(newStep);
+                            }
+
+                            return next;
+                        });
+                    }, 100); // Moderate speed (100ms = 10fps)
+
+                    return () => clearInterval(interval);
+                }
+            }, [screen, routeCoordinates, routeInstructions]);
+
+            // Initialize map
+            useEffect(() => {
+                const shouldShowMap = ['findingHelper', 'helperFound', 'activeHelp', 'helperNavigation', 'arrival'].includes(screen);
+                
+                if (shouldShowMap && mapRef.current && !mapInstance.current) {
+                    setTimeout(() => {
+                        if (mapRef.current && !mapInstance.current) {
+                            mapInstance.current = L.map(mapRef.current, {
+                                center: [USER_LOCATION.lat, USER_LOCATION.lng],
+                                zoom: 14,
+                                zoomControl: false
+                            });
+
+                            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(mapInstance.current);
+
+                            L.marker([USER_LOCATION.lat, USER_LOCATION.lng], {
+                                icon: L.divIcon({
+                                    className: 'custom-marker',
+                                    html: '<div style="background: #dc2626; color: white; padding: 12px; border-radius: 50%; width: 44px; height: 44px; display: flex; align-items: center; justify-content: center; font-size: 20px; border: 3px solid white; box-shadow: 0 2px 12px rgba(0,0,0,0.3);">📍</div>',
+                                })
+                            }).addTo(mapInstance.current);
+
+                            if (screen !== 'helperNavigation' && screen !== 'activeHelp' && screen !== 'arrival') {
+                                mockHelpers.forEach(helper => {
+                                    L.marker([helper.lat, helper.lng], {
+                                        icon: L.divIcon({
+                                            className: 'custom-marker',
+                                            html: `<div style="background: ${helper.isPro ? '#dc2626' : '#10b981'}; color: white; padding: 10px; border-radius: 50%; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; font-size: 18px; border: 3px solid white;">${helper.isPro ? '🚛' : '👤'}</div>`,
+                                        })
+                                    }).addTo(mapInstance.current);
+                                });
+                            }
+                        }
+                    }, 200);
+                }
+
+                if (!shouldShowMap && mapInstance.current) {
+                    mapInstance.current.remove();
+                    mapInstance.current = null;
+                }
+            }, [screen]);
+            
+            // Update helper marker and route line on map
+            useEffect(() => {
+                if (helperPosition && mapInstance.current && (screen === 'helperNavigation' || screen === 'activeHelp')) {
+                    if (helperMarkerRef.current) mapInstance.current.removeLayer(helperMarkerRef.current);
+
+                    helperMarkerRef.current = L.marker([helperPosition.lat, helperPosition.lng], {
+                        icon: L.divIcon({
+                            className: 'custom-marker',
+                            html: '<div style="background: #000; color: white; padding: 12px; border-radius: 50%; width: 48px; height: 48px; display: flex; align-items: center; justify-content: center; font-size: 24px; border: 4px solid white; box-shadow: 0 4px 16px rgba(0,0,0,0.4);">🚗</div>',
+                        })
+                    }).addTo(mapInstance.current);
+
+                    // Draw the full route (only once when route changes)
+                    if (!routeLineRef.current && routeCoordinates.length > 0) {
+                        const routeLatLngs = routeCoordinates.map(coord => [coord.lat, coord.lng]);
+                        routeLineRef.current = L.polyline(routeLatLngs, {
+                            color: '#000',
+                            weight: 5,
+                            opacity: 0.8,
+                            dashArray: '12, 8'
+                        }).addTo(mapInstance.current);
+
+                        // Set initial view with both points visible
+                        mapInstance.current.fitBounds(L.latLngBounds([
+                            [helperPosition.lat, helperPosition.lng],
+                            [USER_LOCATION.lat, USER_LOCATION.lng]
+                        ]), { padding: [100, 100] });
+                    } else {
+                        // Smoothly pan to keep car in view, but don't zoom
+                        mapInstance.current.panTo([helperPosition.lat, helperPosition.lng], {
+                            animate: true,
+                            duration: 0.1
+                        });
+                    }
+                }
+            }, [helperPosition, screen]);
+
+            if (screen === 'home') {
+                return (
+                    <div className="min-h-screen bg-white flex items-center justify-center p-8">
+                        <div className="max-w-md w-full text-center">
+                            <div className="text-6xl mb-4">🚗</div>
+                            <h1 className="text-5xl font-black mb-3">RoadRescue</h1>
+                            <p className="text-gray-600 text-lg mb-12">Help when you need it most</p>
+                            <div className="space-y-4">
+                                <button onClick={() => setScreen('selectProblem')} className="uber-button" style={{padding: '24px'}}>
+                                    <div className="text-2xl mb-2">🆘</div>
+                                    <div className="text-xl font-bold">I Need Help</div>
+                                </button>
+                                <button onClick={() => setScreen('helperDashboard')} className="uber-button-white uber-button" style={{padding: '24px'}}>
+                                    <div className="text-2xl mb-2">💰</div>
+                                    <div className="text-xl font-bold">I Can Help</div>
+                                </button>
+                            </div>
+                            <div className="mt-12 grid grid-cols-3 gap-4 text-sm text-gray-600">
+                                <div><div className="text-2xl font-bold text-black">50%</div><div>Cheaper</div></div>
+                                <div><div className="text-2xl font-bold text-black">&lt;10min</div><div>Response</div></div>
+                                <div><div className="text-2xl font-bold text-black">24/7</div><div>Available</div></div>
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+
+            if (screen === 'selectProblem') {
+                return (
+                    <div className="min-h-screen bg-gray-50">
+                        <div className="top-bar">
+                            <button onClick={() => setScreen('home')} className="text-2xl">←</button>
+                            <h2 className="text-lg font-bold">What's the issue?</h2>
+                            <div></div>
+                        </div>
+                        <div className="pt-20 pb-8 px-4">
+                            <div className="max-w-2xl mx-auto grid grid-cols-2 gap-3">
+                                {problemTypes.map((problem, idx) => (
+                                    <button key={idx} onClick={() => {
+                                        setSelectedProblem(problem);
+                                        setScreen('findingHelper');
+                                        setRouteCoordinates([]);
+                                        setRouteInstructions([]);
+                                        setCurrentRouteIndex(0);
+                                        setShowArrival(false);
+                                        setHelperPosition(null);
+                                        setTimeout(() => {
+                                            setSelectedHelper(mockHelpers[0]);
+                                            setScreen('helperFound');
+                                        }, 2500);
+                                    }} className="bg-white p-6 rounded-2xl hover:shadow-lg transition-all border border-gray-200">
+                                        <div className="text-5xl mb-3">{problem.icon}</div>
+                                        <div className="font-bold text-base">{problem.name}</div>
+                                        <div className="text-sm text-gray-500 mt-1">from ${problem.basePrice}</div>
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+
+            if (screen === 'findingHelper') {
+                return (
+                    <div className="h-screen relative">
+                        <div ref={mapRef} style={{height: '100%', width: '100%'}}></div>
+                        <div className="bottom-sheet slide-up" style={{maxHeight: '30%'}}>
+                            <div className="p-6">
+                                <div className="flex items-center gap-4 mb-4">
+                                    <div className="pulse-dot w-3 h-3 bg-black rounded-full"></div>
+                                    <div>
+                                        <h3 className="text-xl font-bold">Finding help nearby...</h3>
+                                        <p className="text-gray-600 text-sm">{selectedProblem?.name}</p>
+                                    </div>
+                                </div>
+                                <div className="bg-gray-100 rounded-xl p-4">
+                                    <p className="text-sm text-gray-600">Searching 4 helpers in Syracuse</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+
+            if (screen === 'helperFound') {
+                const price = calculatePrice(selectedProblem, selectedHelper.distance);
+                return (
+                    <div className="h-screen relative">
+                        <div ref={mapRef} style={{height: '100%', width: '100%'}}></div>
+                        <div className="bottom-sheet slide-up">
+                            <div className="p-6">
+                                <div className="text-center mb-6">
+                                    <div className="text-4xl mb-2">✓</div>
+                                    <h3 className="text-2xl font-bold">Helper Found</h3>
+                                </div>
+                                <div className="bg-gray-50 rounded-2xl p-5 mb-4">
+                                    <div className="flex items-center gap-4 mb-4">
+                                        <div className="w-14 h-14 bg-black rounded-full flex items-center justify-center text-white text-xl font-bold">
+                                            {selectedHelper.name.split(' ').map(n => n[0]).join('')}
+                                        </div>
+                                        <div className="flex-1">
+                                            <h4 className="font-bold text-lg">{selectedHelper.name}</h4>
+                                            <div className="flex items-center gap-2 text-sm text-gray-600">
+                                                <span>⭐ {selectedHelper.rating}</span>
+                                                <span>•</span>
+                                                <span>{selectedHelper.distance} mi</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-3 pt-3 border-t border-gray-200">
+                                        <div><div className="text-sm text-gray-600">Vehicle</div><div className="font-semibold">{selectedHelper.vehicle}</div></div>
+                                        <div><div className="text-sm text-gray-600">Plate</div><div className="font-semibold">{selectedHelper.plate}</div></div>
+                                    </div>
+                                </div>
+                                <div className="flex gap-3 mb-4">
+                                    <div className="flex-1 bg-gray-50 rounded-xl p-4 text-center">
+                                        <div className="text-2xl font-bold">${price}</div>
+                                        <div className="text-xs text-gray-600 mt-1">Total</div>
+                                    </div>
+                                    <div className="flex-1 bg-gray-50 rounded-xl p-4 text-center">
+                                        <div className="text-2xl font-bold">{Math.round(selectedHelper.distance * 3)} min</div>
+                                        <div className="text-xs text-gray-600 mt-1">ETA</div>
+                                    </div>
+                                </div>
+                                <button onClick={() => {
+                                    setScreen('activeHelp');
+                                    setRouteCoordinates([]);
+                                    setRouteInstructions([]);
+                                    setCurrentRouteIndex(0);
+                                    setShowArrival(false);
+                                    setHelperPosition(null);
+                                }} className="uber-button mb-3">Confirm Request</button>
+                                <button onClick={() => {
+                                    // Cycle to the next helper
+                                    const currentIndex = mockHelpers.findIndex(h => h.id === selectedHelper.id);
+                                    const nextIndex = (currentIndex + 1) % mockHelpers.length;
+                                    setSelectedHelper(mockHelpers[nextIndex]);
+                                }} className="uber-button-white uber-button">Choose Different Helper</button>
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+
+            if (screen === 'activeHelp') {
+                return (
+                    <div className="h-screen relative">
+                        <div ref={mapRef} style={{height: '100%', width: '100%'}}></div>
+                        <div style={{position: 'absolute', top: '16px', left: '16px', right: '16px', zIndex: 1001, background: 'white', borderRadius: '16px', padding: '16px', boxShadow: '0 4px 16px rgba(0,0,0,0.15)'}}>
+                            <div style={{display: 'flex', alignItems: 'center', gap: '12px'}}>
+                                <div className="pulse-dot" style={{width: '12px', height: '12px', background: '#10b981', borderRadius: '50%'}}></div>
+                                <div style={{flex: 1}}>
+                                    <div style={{fontWeight: 'bold', fontSize: '16px'}}>{selectedHelper.name} arriving</div>
+                                    <div style={{fontSize: '14px', color: '#666'}}>{Math.max(0, Math.round(etaMinutes))} min • {Number(distanceRemaining).toFixed(1)} mi</div>
+                                </div>
+                                <div style={{fontSize: '28px'}}>🚗</div>
+                            </div>
+                        </div>
+                        <div className="bottom-sheet slide-up">
+                            <div className="p-6">
+                                <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-4 mb-4">
+                                    <div className="font-bold text-sm mb-2">🚨 Safety First</div>
+                                    <ul className="text-xs text-gray-700 space-y-1">
+                                        <li>• Stay in vehicle with doors locked</li>
+                                        <li>• Verify: {selectedHelper.vehicle}, {selectedHelper.plate}</li>
+                                    </ul>
+                                </div>
+                                <button onClick={() => {
+                                    if (confirm('Cancel? Full refund issued.')) {
+                                        setScreen('home');
+                                        setRouteCoordinates([]);
+                                        setRouteInstructions([]);
+                                        setCurrentRouteIndex(0);
+                                        setShowArrival(false);
+                                        setHelperPosition(null);
+                                    }
+                                }} className="w-full text-red-600 font-semibold py-3">Cancel Request</button>
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+
+            if (screen === 'helperDashboard') {
+                return (
+                    <div className="min-h-screen bg-gray-50">
+                        <div className="top-bar">
+                            <button onClick={() => setScreen('home')} className="text-2xl">←</button>
+                            <h2 className="text-lg font-bold">Helper Mode</h2>
+                            <label className="relative inline-flex items-center cursor-pointer">
+                                <input type="checkbox" className="sr-only peer" checked={helperOnline} onChange={(e) => setHelperOnline(e.target.checked)} />
+                                <div className="w-11 h-6 bg-gray-300 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-black"></div>
+                            </label>
+                        </div>
+                        <div className="pt-20 pb-8 px-4">
+                            <div className="max-w-2xl mx-auto">
+                                <div className="grid grid-cols-3 gap-3 mb-6">
+                                    <div className="bg-white p-4 rounded-xl text-center"><div className="text-2xl font-bold">$487</div><div className="text-xs text-gray-600">This Week</div></div>
+                                    <div className="bg-white p-4 rounded-xl text-center"><div className="text-2xl font-bold">4.9</div><div className="text-xs text-gray-600">Rating ⭐</div></div>
+                                    <div className="bg-white p-4 rounded-xl text-center"><div className="text-2xl font-bold">23</div><div className="text-xs text-gray-600">Helps</div></div>
+                                </div>
+                                {helperOnline ? (
+                                    <>
+                                        <h3 className="font-bold text-lg mb-3">Nearby Requests</h3>
+                                        {[
+                                            { type: "Flat Tire", icon: "🛞", distance: 0.8, amount: 39 },
+                                            { type: "Dead Battery", icon: "🔋", distance: 1.5, amount: 38 },
+                                            { type: "Out of Gas", icon: "⛽", distance: 2.3, amount: 52 }
+                                        ].map((req, idx) => (
+                                            <div key={idx} className="bg-white rounded-2xl p-5 border border-gray-200 mb-3">
+                                                <div className="flex justify-between items-start mb-4">
+                                                    <div>
+                                                        <h4 className="font-bold text-lg">{req.icon} {req.type}</h4>
+                                                        <p className="text-sm text-gray-600">{req.distance} mi</p>
+                                                    </div>
+                                                    <div className="text-2xl font-bold text-green-600">${req.amount}</div>
+                                                </div>
+                                                <button onClick={() => {
+                                                    setScreen('helperNavigation');
+                                                    setRouteCoordinates([]);
+                                                    setRouteInstructions([]);
+                                                    setCurrentRouteIndex(0);
+                                                    setShowArrival(false);
+                                                    setHelperPosition(null);
+                                                }} className="uber-button">Accept & Navigate</button>
+                                            </div>
+                                        ))}
+                                    </>
+                                ) : (
+                                    <div className="bg-white rounded-2xl p-8 text-center">
+                                        <div className="text-4xl mb-4">😴</div>
+                                        <h3 className="font-bold text-xl">You're Offline</h3>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+
+            if (screen === 'helperNavigation') {
+                const dir = routeInstructions.length > 0 ? routeInstructions[currentStep] : null;
+                
+                return (
+                    <div className="h-screen relative">
+                        <div ref={mapRef} style={{height: '100%', width: '100%'}}></div>
+                        <div style={{position: 'absolute', top: '12px', left: '12px', right: '12px', zIndex: 1001, background: '#000', color: 'white', borderRadius: '12px', padding: '12px', boxShadow: '0 4px 16px rgba(0,0,0,0.3)'}}>
+                            {dir ? (
+                                <>
+                                    <div style={{display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px'}}>
+                                        <div style={{fontSize: '28px'}}>{dir.icon}</div>
+                                        <div style={{flex: 1}}>
+                                            <div style={{fontSize: '14px', fontWeight: 'bold'}}>{dir.instruction}</div>
+                                            <div style={{fontSize: '11px', opacity: 0.7}}>{dir.distance} • {dir.street}</div>
+                                        </div>
+                                    </div>
+                                </>
+                            ) : (
+                                <div style={{textAlign: 'center', padding: '8px'}}>
+                                    <div className="pulse-dot" style={{width: '10px', height: '10px', background: 'white', borderRadius: '50%', margin: '0 auto 8px'}}></div>
+                                    <div style={{fontSize: '14px', fontWeight: 'bold'}}>Calculating route...</div>
+                                </div>
+                            )}
+                            <div style={{display: 'flex', justifyContent: 'space-between', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,0.2)'}}>
+                                <div>
+                                    <div style={{fontSize: '20px', fontWeight: 'bold'}}>{Math.max(0, Math.round(etaMinutes))} min</div>
+                                    <div style={{fontSize: '10px', opacity: 0.7}}>{Number(distanceRemaining).toFixed(1)} mi</div>
+                                </div>
+                                <div style={{textAlign: 'right'}}>
+                                    <div style={{fontSize: '20px', fontWeight: 'bold'}}>$39</div>
+                                    <div style={{fontSize: '10px', opacity: 0.7}}>You earn</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div className="bottom-sheet slide-up" style={{maxHeight: '15%'}}>
+                            <div className="p-4">
+                                <div className="grid grid-cols-2 gap-3">
+                                    <button className="bg-black text-white py-3 rounded-xl font-semibold text-sm">📞 Call</button>
+                                    <button className="bg-white border-2 border-gray-200 py-3 rounded-xl font-semibold text-sm">💬 Message</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+
+            if (screen === 'arrival' || showArrival) {
+                return (
+                    <div className="h-screen relative">
+                        <div ref={mapRef} style={{height: '100%', width: '100%'}}></div>
+                        <div className="bottom-sheet slide-up">
+                            <div className="p-6">
+                                <div className="text-center mb-6">
+                                    <div className="text-6xl mb-4">🎉</div>
+                                    <h3 className="text-3xl font-bold mb-2">You've Arrived!</h3>
+                                    <p className="text-gray-600">Time to help the customer</p>
+                                </div>
+                                
+                                <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 mb-4">
+                                    <div className="font-bold mb-2">📋 Job Details</div>
+                                    <p className="text-sm text-gray-700">Flat Tire • Customer waiting nearby</p>
+                                </div>
+                                
+                                <div className="space-y-3">
+                                    <button onClick={() => {
+                                        alert('Starting job! Good luck! 👍');
+                                        setTimeout(() => {
+                                            setScreen('home');
+                                            setRouteCoordinates([]);
+                                            setRouteInstructions([]);
+                                            setCurrentRouteIndex(0);
+                                            setShowArrival(false);
+                                            setHelperPosition(null);
+                                        }, 1000);
+                                    }} className="uber-button">Start Job</button>
+                                    <div className="grid grid-cols-2 gap-3">
+                                        <button className="bg-white border-2 border-gray-200 py-3 rounded-xl font-semibold">📞 Call</button>
+                                        <button className="bg-white border-2 border-gray-200 py-3 rounded-xl font-semibold">💬 Message</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+
+            return null;
+        }
+
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+</body>
+</html>
